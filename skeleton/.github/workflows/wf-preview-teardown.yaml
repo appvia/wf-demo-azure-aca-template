@@ -1,0 +1,85 @@
+# Destroys the pull request's preview instance when the pull request closes,
+# merged or not. The develop environment's shared registry and the images in it
+# are not part of the instance, so they stay.
+#
+# This file is copied into your repository verbatim - Wayfinder does not
+# template it. The job declares `environment: develop`, so it signs in as the
+# develop service account that deployed the preview.
+name: Tear down preview
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  teardown:
+    name: Destroy preview instance
+    runs-on: ubuntu-latest
+    environment: develop
+    env:
+      WAYFINDER_SERVER: ${{ vars.WAYFINDER_SERVER }}
+      WAYFINDER_SERVICE_ACCOUNT: ${{ vars.WAYFINDER_SERVICE_ACCOUNT }}
+      WAYFINDER_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Wayfinder CLI
+        run: bash .wayfinder/install-wf.sh
+
+      # A pull request can close before any preview deployed, so an instance that
+      # does not exist is skipped with a notice. Absence counts only when the
+      # listing succeeded AND parsed as exactly one StackInstanceSummaryList with
+      # a well-formed items list that lacks this name. A failed listing, empty or
+      # unparsable output, or any other shape fails the job. `wf down` itself is
+      # never guarded: a destroy that fails turns this job red, so leftover cloud
+      # resources are never reported as a clean teardown.
+      #
+      # items may be null: the server's Go list type has `json:"items"` without
+      # omitempty, so an environment with no instances marshals as null.
+      - name: Destroy the preview instance
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          source .wayfinder/ci.env
+
+          instance="${WF_SERVICE_NAME}-pr${PR_NUMBER}"
+          workspace="$(cut -d: -f2 <<<"${WAYFINDER_SERVICE_ACCOUNT}")"
+
+          wf get stackinstance -w "${workspace}" -e "${WAYFINDER_ENVIRONMENT}" -o json > ./instances.json
+          present="$(jq -r --arg name "${instance}" '
+            if type == "object"
+               and .kind == "StackInstanceSummaryList"
+               and has("items")
+               and (.items == null
+                    or ((.items | type) == "array"
+                        and all(.items[]; (.metadata.name | type) == "string")))
+            then [(.items // [])[].metadata.name] | any(.[]; . == $name)
+            else error("unexpected wf get stackinstance output")
+            end' ./instances.json)"
+
+          case "${present}" in
+            true)
+              ;;
+            false)
+              echo "::notice title=No preview to destroy::${instance} does not exist in ${workspace}/${WAYFINDER_ENVIRONMENT}; nothing to tear down."
+              exit 0
+              ;;
+            *)
+              echo "::error::Could not tell whether ${instance} exists: wf get stackinstance returned no usable list (jq result '${present}'). Nothing was destroyed."
+              exit 1
+              ;;
+          esac
+
+          wf down --non-interactive --timeout 30m \
+            -i "${instance}" \
+            -e "${WAYFINDER_ENVIRONMENT}"
+          echo "::notice title=Preview destroyed::${instance}"

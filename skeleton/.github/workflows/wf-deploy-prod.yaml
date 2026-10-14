@@ -1,0 +1,92 @@
+# Promotes a tagged release to production.
+#
+# Production never builds. The image this tag's commit got when it merged to
+# main (sha-<commit> in the develop registry) is imported into the production
+# registry and tagged with the release, then <service>-prod is updated to it.
+# A tag on a commit that was never built for develop fails at `pushimage` with
+# a clear error, and production keeps running what it ran before.
+#
+# `environment: production` is GitHub's own gate: configure reviewers or wait
+# timers on it. It also scopes the OIDC token to the production environment,
+# which is the only token the production service account trusts.
+#
+# This file is copied into your repository verbatim - Wayfinder does not
+# template it.
+name: Deploy to production
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      WAYFINDER_SERVER: ${{ vars.WAYFINDER_SERVER }}
+      WAYFINDER_SERVICE_ACCOUNT: ${{ vars.WAYFINDER_SERVICE_ACCOUNT }}
+      WAYFINDER_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+      WF_REGION: ${{ vars.WF_REGION }}
+      WF_IDENTITY: ${{ vars.WF_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install the Wayfinder CLI
+        run: bash .wayfinder/install-wf.sh
+
+      # The commit the tag points at, read from the checkout so an annotated
+      # tag resolves to its commit. `wf deploy` and its pushimage action
+      # inherit PROMOTE_SOURCE_TAG from the job environment.
+      - name: Work out the image to promote
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "PROMOTE_SOURCE_TAG=sha-${sha:0:7}" >> "$GITHUB_ENV"
+
+      - name: Deploy the release
+        env:
+          RELEASE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          source .wayfinder/ci.env
+
+          # The Azure identity sits in the same workspace as the service
+          # account, which is the middle segment of tenant:workspace:name.
+          workspace="$(cut -d: -f2 <<<"${WAYFINDER_SERVICE_ACCOUNT}")"
+          args=(
+            --identity "${WF_IDENTITY:-${workspace}/${WAYFINDER_ENVIRONMENT}/azure-${WAYFINDER_ENVIRONMENT}}"
+            --region "${WF_REGION}"
+          )
+
+          instance="${WF_SERVICE_NAME}-prod"
+          echo "Promoting ${PROMOTE_SOURCE_TAG} as ${RELEASE}"
+
+          wf deploy --non-interactive --timeout 30m \
+            -i "${instance}" \
+            -e "${WAYFINDER_ENVIRONMENT}" \
+            -f Wayfinder.yaml \
+            --env-var RELEASE="${RELEASE}" \
+            --out-file ./deploy.json \
+            "${args[@]}"
+
+          url="$(jq -r '.componentOutputs.app.url.value // empty' ./deploy.json)"
+          url="https://${url#https://}"
+          echo "::notice title=Production URL::${url}"
+          {
+            echo "### Released ${RELEASE} to ${WAYFINDER_ENVIRONMENT}"
+            echo ""
+            echo "- URL: ${url}"
+            echo "- Instance: \`${instance}\`"
+            echo "- Image: promoted from \`${PROMOTE_SOURCE_TAG}\` (no rebuild)"
+          } >> "$GITHUB_STEP_SUMMARY"

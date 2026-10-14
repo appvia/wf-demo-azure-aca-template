@@ -1,0 +1,116 @@
+# What gets deployed, and what each part is allowed to reach.
+#
+# Three kinds of placeholder are filled in at deploy time, not when you edit:
+#
+#   $${{ ... }}  A Wayfinder expression - a variable, a component's output, or a
+#               fact about the stack. Resolved in dependency order as the
+#               deploy runs.
+#   ${NAME}     Supplied with `wf deploy --env-var NAME=v`, or taken from the
+#               environment `wf` runs in. RELEASE is the only one: it tags the
+#               image and is shown on the page.
+#   $${NAME}    Left alone by Wayfinder and expanded by the shell an action
+#               runs in.
+#
+# The registry is NOT part of this stack. Each environment has one shared Azure
+# Container Registry, created when the team was onboarded and published to this
+# stack as the environment variables acrLoginServer and acrId, so deploying or
+# tearing down an instance never recreates it or loses images.
+#
+# Deploy it yourself with:
+#   wf up -f Wayfinder.yaml -i ${{ .Inputs.serviceName }}-dev -w <workspace> -e <environment> \
+#     --identity <workspace>/<environment>/azure-<environment> --region ${{ .Inputs.region }} \
+#     --env-var RELEASE=$(git describe --always --dirty)
+apiVersion: v1
+# The stack this repository belongs to, named when the repository was created.
+name: ${{ .Stack.Name }}
+description: "${{ .Inputs.description }}"
+
+vars:
+  - name: azureResourceGroup
+    description: Resource group the environment's identity owns. Set per environment by onboarding.
+    type: string
+  - name: acrLoginServer
+    description: Login server of the environment's shared registry, e.g. crxxxx.azurecr.io. Set by onboarding.
+    type: string
+  - name: acrId
+    description: Resource ID of the environment's shared registry. Set by onboarding.
+    type: string
+  - name: acrPromoteFromId
+    description: >-
+      Resource ID of the registry releases are promoted from. Set only in the
+      production environment, where it names the develop registry; empty
+      elsewhere, which means build rather than promote.
+    type: string
+    optional: true
+    defaultValue: ""
+  - name: acrPromoteFromLoginServer
+    description: Login server of the registry releases are promoted from. Set only in production.
+    type: string
+    optional: true
+    defaultValue: ""
+  - name: azureLocation
+    description: Azure region of the Container Apps environment.
+    type: string
+    optional: true
+    defaultValue: "uksouth"
+
+components:
+
+  # Makes sure this RELEASE's image is in the environment's registry, as the
+  # environment's own Azure identity (`withAccess: cloud`), so no registry
+  # credential exists anywhere. Everything it does is in
+  # .wayfinder/ensure-image.sh:
+  #   develop     - builds and pushes the image, unless the tag is already there.
+  #   production  - never builds: imports the image already built for this
+  #                 commit from the develop registry (PROMOTE_SOURCE_TAG, set by
+  #                 the production workflow) and tags it with the release.
+  pushimage:
+    type: LocalAction
+    withAccess:
+      - targetName: cloud
+    localAction:
+      run: |-
+        bash .wayfinder/ensure-image.sh \
+          $${{ .Vars.acrLoginServer }} \
+          ${{ .Inputs.serviceName }} \
+          ${RELEASE} \
+          "$${{ .Vars.acrPromoteFromId }}" \
+          "$${{ .Vars.acrPromoteFromLoginServer }}"
+
+  # The Container App. It pulls from the shared registry with its own
+  # user-assigned identity holding AcrPull and nothing else. APP_RELEASE puts
+  # the release on the page at runtime, so a promoted image shows its own tag.
+  app:
+    type: CloudResource
+    plan: azure-container-app-acr@0.1.0
+    needs: [pushimage]
+    inputs:
+      - name: name
+        value: "$${{ .Stack.Instance.Name }}"
+      - name: resource_group_name
+        value: "$${{ .Vars.azureResourceGroup }}"
+      - name: location
+        value: "$${{ .Vars.azureLocation }}"
+      - name: image
+        value: "$${{ .Vars.acrLoginServer }}/${{ .Inputs.serviceName }}:${RELEASE}"
+      - name: registry_id
+        value: "$${{ .Vars.acrId }}"
+      - name: registry_login_server
+        value: "$${{ .Vars.acrLoginServer }}"
+      - name: target_port
+        value: 8080
+      - name: env
+        value:
+          APP_RELEASE: "${RELEASE}"
+
+  # Asks the deployed page for an answer, retrying for at most five minutes
+  # while the new revision starts. A deploy that leaves the page broken fails
+  # here. No `withAccess`: it only uses the public URL.
+  smoke:
+    type: LocalAction
+    needs: [app]
+    localAction:
+      run: |-
+        url="$${{ .Components.app.url }}"
+        curl -fsS --retry 20 --retry-all-errors --retry-max-time 300 \
+          "https://$${url#https://}" | grep -q '<h1>'

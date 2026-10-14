@@ -1,0 +1,138 @@
+# Azure Container App (hello world) - the template itself.
+#
+# Parsed strictly: an unrecognised key here is an error, not a warning.
+# Everything under skeleton/ is what gets written into the new repository.
+#
+name: Azure Container App (hello world)
+description: >-
+  A hello-world web page in a container on Azure Container Apps, pulled from
+  the environment's shared Azure Container Registry. Pull requests get a
+  preview, merging deploys develop, and a v* tag promotes the image already
+  built for develop into production. No registry credential anywhere.
+
+# The repository ships a Wayfinder.yaml and the stack is the point of it.
+forStack: true
+
+inputs:
+  - name: serviceName
+    description: >-
+      Name of the service. Used for the container image repository and the
+      stack instance names (<service>-pr<N>, <service>-develop, <service>-prod).
+    type: string
+    minLength: 3
+    maxLength: 22
+    pattern: "^[a-z][a-z0-9-]{1,20}[a-z0-9]$"
+
+  - name: description
+    description: What this service does, recorded in its README and on the stack.
+    type: string
+    optional: true
+    defaultValue: ""
+    maxLength: 200
+
+  # Two environments only. Pull request previews are just more stack instances
+  # in the develop environment, deployed with the develop service account.
+  - name: developEnvironment
+    description: >-
+      Environment pull request previews and merges to main deploy to. Pick one
+      this workspace has; onboarding must have given it a shared registry.
+    type: string
+    refType:
+      kind: Environment
+
+  - name: prodEnvironment
+    description: >-
+      Environment a `v*` tag deploys to. Pick one this workspace has;
+      onboarding must have given it a shared registry and the develop registry
+      to promote from.
+    type: string
+    refType:
+      kind: Environment
+
+  - name: region
+    description: Azure region the service deploys into.
+    type: string
+    optional: true
+    defaultValue: "uksouth"
+
+# One Wayfinder service account per GitHub environment, each trusted only by a
+# workflow run in THIS repository whose job declares that environment - so the
+# credential a pull request or a merge can use is not the one that reaches
+# production.
+#
+# Wayfinder does not create these. Scaffolding renders them into manifests and
+# hands them to the person scaffolding, who applies them with their own token
+# (`--apply-configuration`, or `wf get coderepo NAME -w WORKSPACE
+# --configuration --apply` afterwards).
+#
+# The subject names the repository by id as well as by name. Leave audiences
+# out: Wayfinder stamps the tenant's own when the credential is applied.
+wayfinderServiceAccounts:
+  developDeployer:
+    name: ${{ .Inputs.developEnvironment }}-${{ .Repo.Name }}-develop
+    roles:
+      - role: deployer
+        workspace: ${{ .Workspace }}
+        environment: ${{ .Inputs.developEnvironment }}
+      - role: workspace.cataloguemanagement
+        workspace: ${{ .Workspace }}
+    trust:
+      issuer: https://token.actions.githubusercontent.com
+      subject: repo:${{ .Repo.Organization }}@${{ .Repo.OrganizationID }}/${{ .Repo.Name }}@${{ .Repo.ID }}:environment:develop
+
+  prodDeployer:
+    name: ${{ .Inputs.prodEnvironment }}-${{ .Repo.Name }}-prod
+    roles:
+      - role: deployer
+        workspace: ${{ .Workspace }}
+        environment: ${{ .Inputs.prodEnvironment }}
+      - role: workspace.cataloguemanagement
+        workspace: ${{ .Workspace }}
+    trust:
+      issuer: https://token.actions.githubusercontent.com
+      subject: repo:${{ .Repo.Organization }}@${{ .Repo.OrganizationID }}/${{ .Repo.Name }}@${{ .Repo.ID }}:environment:production
+
+# GitHub variables, set when the repository is created. The ones with no
+# githubEnvironment are repository-wide; the rest are set on that deployment
+# environment, which is also what creates the `develop` and `production`
+# GitHub environments on the repository. These names are what
+# .github/workflows/ reads.
+repository:
+  variables:
+    - name: WAYFINDER_SERVER
+      value: ${{ .Wayfinder.Server }}
+    - name: WF_REGION
+      value: ${{ .Inputs.region }}
+
+    - name: WAYFINDER_SERVICE_ACCOUNT
+      value: ${{ .ServiceAccounts.developDeployer.Ref }}
+      githubEnvironment: develop
+    - name: WAYFINDER_ENVIRONMENT
+      value: ${{ .Inputs.developEnvironment }}
+      githubEnvironment: develop
+
+    - name: WAYFINDER_SERVICE_ACCOUNT
+      value: ${{ .ServiceAccounts.prodDeployer.Ref }}
+      githubEnvironment: production
+    - name: WAYFINDER_ENVIRONMENT
+      value: ${{ .Inputs.prodEnvironment }}
+      githubEnvironment: production
+
+skeleton:
+  path: skeleton
+
+  # Files copied byte for byte. Their contents are NOT rendered, so they must not
+  # use the `$${{ }}` escape either - it would land literally.
+  #
+  # The workflows are full of GitHub Actions' own ${{ }} expressions and the
+  # scripts of ordinary shell ${VAR}, so keeping them raw means they are valid
+  # exactly as written. Per-repository values reach them through
+  # .wayfinder/ci.env, which IS rendered.
+  #
+  # These globs are matched with path.Match: `**` is not supported, and `*.yaml`
+  # does not match `*.yml`, which is why both are listed.
+  raw:
+    - ".github/workflows/*.yaml"
+    - ".github/workflows/*.yml"
+    - ".wayfinder/*.sh"
+    - "docker/*.sh"

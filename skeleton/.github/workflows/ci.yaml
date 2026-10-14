@@ -1,0 +1,176 @@
+# Pull request checks.
+#
+# Validates the stack against Wayfinder without applying anything, then deploys
+# a preview instance <service>-pr<number> into the develop environment and posts
+# its URL as a new pull request comment, a job annotation and the job summary.
+# The preview is destroyed by wf-preview-teardown.yaml when the pull request
+# closes; the environment's shared registry and its images stay.
+#
+# There is no image build step here: the stack's `pushimage` component builds
+# the image and pushes it to the develop registry as the develop environment's
+# Azure identity, so there is no registry credential to store. It runs on this
+# runner, which already has docker.
+#
+# Both jobs declare `environment: develop`. GitHub scopes the OIDC token to that
+# environment and the develop service account trusts that token only, so a job
+# that dropped the line could not sign in at all.
+#
+# This file is copied into your repository verbatim - Wayfinder does not
+# template it.
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write # lets GitHub mint the OIDC token Wayfinder authenticates with
+
+# Serialised, never cancelled: a cancelled `wf deploy` can leave a half-applied
+# stack behind.
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate stack
+    runs-on: ubuntu-latest
+    environment: develop
+    env:
+      WAYFINDER_SERVER: ${{ vars.WAYFINDER_SERVER }}
+      WAYFINDER_SERVICE_ACCOUNT: ${{ vars.WAYFINDER_SERVICE_ACCOUNT }}
+      WAYFINDER_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+      WF_REGION: ${{ vars.WF_REGION }}
+      WF_IDENTITY: ${{ vars.WF_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Wayfinder CLI
+        run: bash .wayfinder/install-wf.sh
+
+      # Plans the deployment server-side and applies none of it: no image is
+      # built and no LocalAction runs.
+      - name: Validate the stack
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          source .wayfinder/ci.env
+
+          # The Azure identity sits in the same workspace as the service
+          # account, which is the middle segment of tenant:workspace:name.
+          workspace="$(cut -d: -f2 <<<"${WAYFINDER_SERVICE_ACCOUNT}")"
+          args=(
+            --identity "${WF_IDENTITY:-${workspace}/${WAYFINDER_ENVIRONMENT}/azure-${WAYFINDER_ENVIRONMENT}}"
+            --region "${WF_REGION}"
+          )
+
+          wf deploy --dry-run --non-interactive \
+            -i "${WF_SERVICE_NAME}-pr${PR_NUMBER}" \
+            -e "${WAYFINDER_ENVIRONMENT}" \
+            -f Wayfinder.yaml \
+            --env-var RELEASE="pr-${PR_NUMBER}-${GITHUB_SHA:0:7}" \
+            "${args[@]}"
+
+  preview:
+    name: Preview environment
+    needs: [validate]
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    environment: develop
+    env:
+      WAYFINDER_SERVER: ${{ vars.WAYFINDER_SERVER }}
+      WAYFINDER_SERVICE_ACCOUNT: ${{ vars.WAYFINDER_SERVICE_ACCOUNT }}
+      WAYFINDER_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+      WF_REGION: ${{ vars.WF_REGION }}
+      WF_IDENTITY: ${{ vars.WF_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Wayfinder CLI
+        run: bash .wayfinder/install-wf.sh
+
+      # RELEASE tags the image and is shown on the page, so a running preview
+      # names the pull request and commit it came from.
+      - name: Deploy the preview instance
+        id: deploy
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          source .wayfinder/ci.env
+
+          # The Azure identity sits in the same workspace as the service
+          # account, which is the middle segment of tenant:workspace:name.
+          workspace="$(cut -d: -f2 <<<"${WAYFINDER_SERVICE_ACCOUNT}")"
+          args=(
+            --identity "${WF_IDENTITY:-${workspace}/${WAYFINDER_ENVIRONMENT}/azure-${WAYFINDER_ENVIRONMENT}}"
+            --region "${WF_REGION}"
+          )
+
+          # One instance per pull request, so two open pull requests never
+          # deploy over each other.
+          instance="${WF_SERVICE_NAME}-pr${PR_NUMBER}"
+          release="pr-${PR_NUMBER}-${GITHUB_SHA:0:7}"
+
+          wf deploy --non-interactive --timeout 30m \
+            -i "${instance}" \
+            -e "${WAYFINDER_ENVIRONMENT}" \
+            -f Wayfinder.yaml \
+            --env-var RELEASE="${release}" \
+            --label "preview:pr-${PR_NUMBER}" \
+            --out-file ./preview.json \
+            "${args[@]}"
+
+          url="$(jq -r '.componentOutputs.app.url.value // empty' ./preview.json)"
+          if [[ -z "${url}" ]]; then
+            echo "::error::The preview deployed but published no app URL."
+            exit 1
+          fi
+          url="https://${url#https://}"
+
+          {
+            echo "instance=${instance}"
+            echo "release=${release}"
+            echo "url=${url}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Preview URL::${url}"
+          {
+            echo "### Preview deployed"
+            echo ""
+            echo "- URL: ${url}"
+            echo "- Instance: \`${instance}\` in \`${WAYFINDER_ENVIRONMENT}\`"
+            echo "- Release: \`${release}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A new comment on every deploy, so the conversation shows each preview
+      # the pull request has had.
+      - name: Comment the preview URL on the pull request
+        uses: actions/github-script@v8
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          PREVIEW_INSTANCE: ${{ steps.deploy.outputs.instance }}
+          PREVIEW_RELEASE: ${{ steps.deploy.outputs.release }}
+          PREVIEW_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+        with:
+          script: |
+            const body = [
+              '### Wayfinder preview',
+              '',
+              `**${process.env.PREVIEW_URL}**`,
+              '',
+              `Instance \`${process.env.PREVIEW_INSTANCE}\` in environment ` +
+                `\`${process.env.PREVIEW_ENVIRONMENT}\` · release \`${process.env.PREVIEW_RELEASE}\` · ` +
+                `commit ${context.payload.pull_request.head.sha.substring(0, 7)}`,
+              '',
+              '<sub>Destroyed automatically when this pull request closes.</sub>',
+            ].join('\n')
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            })

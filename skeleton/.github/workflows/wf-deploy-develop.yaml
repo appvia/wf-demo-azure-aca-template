@@ -1,0 +1,75 @@
+# Deploys <service>-develop to the develop environment on every merge to main.
+#
+# RELEASE is sha-<commit>, which tags the image in the develop registry and is
+# shown on the page. A `v*` tag on this commit later promotes exactly this image
+# to production (see wf-deploy-prod.yaml), so production never rebuilds.
+#
+# This file is copied into your repository verbatim - Wayfinder does not
+# template it.
+name: Deploy to develop
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-develop
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    # Scopes the OIDC token to the develop GitHub environment, which is what
+    # the develop service account trusts.
+    environment: develop
+    env:
+      WAYFINDER_SERVER: ${{ vars.WAYFINDER_SERVER }}
+      WAYFINDER_SERVICE_ACCOUNT: ${{ vars.WAYFINDER_SERVICE_ACCOUNT }}
+      WAYFINDER_ENVIRONMENT: ${{ vars.WAYFINDER_ENVIRONMENT }}
+      WF_REGION: ${{ vars.WF_REGION }}
+      WF_IDENTITY: ${{ vars.WF_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Wayfinder CLI
+        run: bash .wayfinder/install-wf.sh
+
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          source .wayfinder/ci.env
+
+          # The Azure identity sits in the same workspace as the service
+          # account, which is the middle segment of tenant:workspace:name.
+          workspace="$(cut -d: -f2 <<<"${WAYFINDER_SERVICE_ACCOUNT}")"
+          args=(
+            --identity "${WF_IDENTITY:-${workspace}/${WAYFINDER_ENVIRONMENT}/azure-${WAYFINDER_ENVIRONMENT}}"
+            --region "${WF_REGION}"
+          )
+
+          instance="${WF_SERVICE_NAME}-develop"
+          release="sha-${GITHUB_SHA:0:7}"
+
+          wf deploy --non-interactive --timeout 30m \
+            -i "${instance}" \
+            -e "${WAYFINDER_ENVIRONMENT}" \
+            -f Wayfinder.yaml \
+            --env-var RELEASE="${release}" \
+            --out-file ./deploy.json \
+            "${args[@]}"
+
+          url="$(jq -r '.componentOutputs.app.url.value // empty' ./deploy.json)"
+          url="https://${url#https://}"
+          echo "::notice title=Develop URL::${url}"
+          {
+            echo "### Deployed to ${WAYFINDER_ENVIRONMENT}"
+            echo ""
+            echo "- URL: ${url}"
+            echo "- Instance: \`${instance}\`"
+            echo "- Release: \`${release}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
