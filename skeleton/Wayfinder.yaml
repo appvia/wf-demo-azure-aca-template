@@ -73,9 +73,9 @@ components:
     localAction:
       run: |-
         bash .wayfinder/ensure-image.sh \
-          $${{ .Vars.acrLoginServer }} \
-          ${{ .Inputs.serviceName }} \
-          ${RELEASE} \
+          "$${{ .Vars.acrLoginServer }}" \
+          "${{ .Inputs.serviceName }}" \
+          "${RELEASE}" \
           "$${{ .Vars.acrPromoteFromId }}" \
           "$${{ .Vars.acrPromoteFromLoginServer }}"
 

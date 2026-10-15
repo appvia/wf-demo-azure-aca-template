@@ -59,6 +59,12 @@ jobs:
           RELEASE: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # The tag is shell-expanded by the pushimage action, so refuse
+          # anything git allows in a tag name beyond a plain release string.
+          if [[ ! "${RELEASE}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::Tag '${RELEASE}' is not a valid release (expected ^v[0-9A-Za-z._-]+$)."
+            exit 1
+          fi
           source .wayfinder/ci.env
 
           # The Azure identity sits in the same workspace as the service
@@ -81,6 +87,10 @@ jobs:
             "${args[@]}"
 
           url="$(jq -r '.componentOutputs.app.url.value // empty' ./deploy.json)"
+          if [[ -z "${url}" ]]; then
+            echo "::error::The release deployed but published no app URL."
+            exit 1
+          fi
           url="https://${url#https://}"
           echo "::notice title=Production URL::${url}"
           {

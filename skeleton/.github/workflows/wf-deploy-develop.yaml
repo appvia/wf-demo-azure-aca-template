@@ -64,6 +64,10 @@ jobs:
             "${args[@]}"
 
           url="$(jq -r '.componentOutputs.app.url.value // empty' ./deploy.json)"
+          if [[ -z "${url}" ]]; then
+            echo "::error::The deploy published no app URL."
+            exit 1
+          fi
           url="https://${url#https://}"
           echo "::notice title=Develop URL::${url}"
           {
