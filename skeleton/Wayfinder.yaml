@@ -22,7 +22,9 @@
 #     --env-var RELEASE=$(git describe --always --dirty)
 apiVersion: v1
 # The stack this repository belongs to, named when the repository was created.
-name: ${{ .Stack.Name }}
+# wf v3.4.0 coderepo dry-run omits the stack context. Only that preview uses
+# the repository name; real scaffolds use the explicitly selected stack.
+name: ${{ if .Stack }}${{ .Stack.Name }}${{ else }}${{ .Repo.Name }}${{ end }}
 description: "${{ .Inputs.description }}"
 
 vars:
